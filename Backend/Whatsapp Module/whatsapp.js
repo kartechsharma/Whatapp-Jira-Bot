@@ -1,54 +1,38 @@
-// import venom from "venom-bot";
-
-// venom
-//   .create({
-//     session: "my-session",
-//     headless: true,
-//     browserArgs: ["--headless=new"], // 👈 important for Chrome 109+
-//   })
-//   .then((client) => {
-//     start(client);
-//   })
-//   .catch((err) => console.error(err));
-
-// function start(client) {
-//   client.onMessage(async (message) => {
-//     console.log("📩 Incoming:", message.body);
-
-//     if (message.body.toLowerCase() === "hi") {
-//       await client.sendText(message.from, "Hello 👋, I am your assistant!");
-//       console.log("✅ Reply sent");
-//     }
-//   });
-// }
-
+// whatsapp.js
 import venom from "venom-bot";
-import fetch from "node-fetch";
 
-venom
-  .create({
-    session: "my-session",
-    browserPathExecutable: "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe", // 👈 Add this
-    headless: false, // So you can see the browser
-  })
-  .then((client) => start(client))
-  .catch((err) => console.log(err));
+let qrCodeImage = null;
+let clientInstance = null;
 
-function start(client) {
-  client.onMessage(async (message) => {
-    if (!message.isGroupMsg) {
-      console.log("📩 New WhatsApp Message:", message.body);
-
-      try {
-        await fetch("http://localhost:3000/tickets", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ from: message.from, text: message.body }),
-        });
-        console.log("✅ Message forwarded to server.js");
-      } catch (err) {
-        console.error("❌ Error forwarding message:", err);
-      }
+export async function initWhatsapp() {
+  return venom.create(
+    {
+      session: "my-session",
+      browserPathExecutable: "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+      headless: true,
+    },
+    // QR code callback
+    (base64Qrimg, asciiQR) => {
+      qrCodeImage = base64Qrimg; // 🔥 store base64 image
+      console.log("📲 QR Code updated!");
     }
+  ).then(async (client) => {
+    clientInstance = client;
+    console.log("✅ WhatsApp connected!");
+
+    const me = await client.getHostDevice();
+    console.log("👤 Logged in as:", me);
+
+    // Example: only log your number
+    console.log("📞 My WhatsApp number:", me.wid.user);
+
+
+    client.onMessage((message) => {
+      console.log("📩", message.from, ":", message.body);
+    });
   });
+}
+
+export function getQrCode() {
+  return qrCodeImage;
 }
