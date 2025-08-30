@@ -6,11 +6,12 @@ const Dashboard = () => {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [isGenerating, setIsGenerating] = useState(false);
-  const [activeTab, setActiveTab] = useState("latest");
+  const [activeTab, setActiveTab] = useState("pending"); // Changed default to pending
   const [pendingTickets, setPendingTickets] = useState([]);
   const [completedTickets, setCompletedTickets] = useState([]);
   const [isPushing, setIsPushing] = useState(false);
   const [isSavingPending, setIsSavingPending] = useState(false);
+  const [pushingTickets, setPushingTickets] = useState({}); // Add this state
 
   // Save template as pending
   const saveAsPending = async (draft) => {
@@ -55,6 +56,7 @@ const Dashboard = () => {
     try {
       setLoading(true);
       const response = await fetch('http://localhost:4000/latest-ticket-draft');
+      //const response = fetchLatestTicketDraft();
       if (!response.ok) throw new Error('Failed to fetch ticket draft');
       const data = await response.json();
       
@@ -95,7 +97,7 @@ const Dashboard = () => {
     }
 
     try {
-      setIsPushing(true);
+      setPushingTickets(prev => ({ ...prev, [templateId]: true }));
       setError(null); // Clear any previous errors
 
       const response = await fetch(`http://localhost:4000/ticket/${templateId}/push-to-jira`, {
@@ -128,7 +130,40 @@ const Dashboard = () => {
       setError(err.message);
       console.error('Error pushing to Jira:', err);
     } finally {
-      setIsPushing(false);
+      setPushingTickets(prev => ({ ...prev, [templateId]: false }));
+    }
+  };
+
+  // Add delete functionality
+  const deleteTicket = async (templateId) => {
+    if (!templateId) {
+      setError("No template ID provided");
+      return;
+    }
+
+    try {
+      setPushingTickets(prev => ({ ...prev, [`delete_${templateId}`]: true }));
+      setError(null);
+
+      const response = await fetch(`http://localhost:4000/ticket/${templateId}/delete`, {
+        method: 'DELETE',
+        headers: {
+          'Content-Type': 'application/json'
+        }
+      });
+      
+      if (!response.ok) {
+        throw new Error('Failed to delete ticket');
+      }
+
+      // Refresh the templates after deletion
+      await fetchTemplates();
+
+    } catch (err) {
+      setError(err.message);
+      console.error('Error deleting ticket:', err);
+    } finally {
+      setPushingTickets(prev => ({ ...prev, [`delete_${templateId}`]: false }));
     }
   };
 
@@ -141,6 +176,9 @@ const Dashboard = () => {
       const data = JSON.parse(event.data);
       setTicketDraft(data.ticket);
       setIsGenerating(false);
+      //window.location.reload();
+      // Refresh templates when receiving updates
+      fetchLatestTicketDraft();
     };
 
     eventSource.addEventListener('generating', () => setIsGenerating(true));
@@ -159,6 +197,20 @@ const Dashboard = () => {
   }
 
   if (isGenerating) {
+    fetchLatestTicketDraft();
+    fetchTemplates();
+
+    const eventSource = new EventSource('http://localhost:4000/ticket-updates');
+    eventSource.onmessage = (event) => {
+      const data = JSON.parse(event.data);
+      setTicketDraft(data.ticket);
+      setIsGenerating(false);
+      fetchLatestTicketDraft();
+    };
+
+    eventSource.addEventListener('generating', () => setIsGenerating(true));
+    eventSource.addEventListener('error', () => setIsGenerating(false));
+
     return (
       <div className="dashboard-loading">
         <div className="loader"></div>
@@ -169,8 +221,8 @@ const Dashboard = () => {
 
   if (error) return <div className="dashboard-error">Error: {error}</div>;
 
-  // Helper: Render ticket list
-  const renderTickets = (tickets, title, showPushButton = false) => (
+  // Helper: Render ticket list with push and delete buttons
+  const renderTickets = (tickets, title, showActions = false) => (
     <div className="ticket-draft">
       <h2>{title}</h2>
       {tickets.length ? (
@@ -182,17 +234,23 @@ const Dashboard = () => {
                 <span className={`priority-badge priority-${template.priority?.toLowerCase()}`}>
                   {template.priority}
                 </span>
-                {template.jiraKey && (
-                  <span className="jira-key">{template.jiraKey}</span>
-                )}
-                {showPushButton && !template.jiraKey && (
-                  <button 
-                    className="push-to-jira-btn"
-                    onClick={() => pushToJira(template._id)}
-                    disabled={isPushing}
-                  >
-                    {isPushing ? 'Pushing...' : 'Push to Jira'}
-                  </button>
+                {showActions && (
+                  <div className="ticket-actions">
+                    <button 
+                      className="push-to-jira-btn"
+                      onClick={() => pushToJira(template._id)}
+                      disabled={pushingTickets[template._id]}
+                    >
+                      {pushingTickets[template._id] ? 'Pushing...' : 'Push to Jira'}
+                    </button>
+                    <button 
+                      className="delete-btn"
+                      onClick={() => deleteTicket(template._id)}
+                      disabled={pushingTickets[`delete_${template._id}`]}
+                    >
+                      {pushingTickets[`delete_${template._id}`] ? 'Deleting...' : 'Delete'}
+                    </button>
+                  </div>
                 )}
               </div>
               <div className="ticket-description">
@@ -209,14 +267,7 @@ const Dashboard = () => {
 
   return (
     <div className="dashboard-container">
-      {/* Tabs */}
       <div className="tabs">
-        <button
-          className={activeTab === "latest" ? "active" : ""}
-          onClick={() => setActiveTab("latest")}
-        >
-          Latest Draft
-        </button>
         <button
           className={activeTab === "pending" ? "active" : ""}
           onClick={() => setActiveTab("pending")}
@@ -232,58 +283,6 @@ const Dashboard = () => {
       </div>
 
       {/* Tab Content */}
-      {activeTab === "latest" && (
-        ticketDraft ? (
-          <div className="ticket-draft">
-            <h2>Latest Ticket Draft</h2>
-            <div className="ticket-info">
-              <div className="info-row">
-                <span className="label">Summary:</span>
-                <span className="value">{ticketDraft.summary}</span>
-              </div>
-              <div className="info-row">
-                <span className="label">Issue Type:</span>
-                <span className="value">{ticketDraft.issueType}</span>
-              </div>
-              <div className="info-row">
-                <span className="label">Priority:</span>
-                <span className="value">
-                  <span className={`priority-badge priority-${ticketDraft.priority.toLowerCase()}`}>
-                    {ticketDraft.priority}
-                  </span>
-                </span>
-              </div>
-              <div className="info-row description">
-                <span className="label">Description:</span>
-                <div className="value">{ticketDraft.description}</div>
-              </div>
-              <div className="info-row actions">
-                {ticketDraft && (
-                  <>
-                    <button 
-                      className="push-to-jira-btn"
-                      onClick={() => pushToJira(ticketDraft._id)}
-                      disabled={isPushing}
-                    >
-                      {isPushing ? 'Pushing to Jira...' : 'Push to Jira'}
-                    </button>
-                    <button 
-                      className="move-to-pending-btn"
-                      onClick={() => saveAsPending(ticketDraft)}
-                      disabled={isPushing || isSavingPending}
-                    >
-                      {isSavingPending ? 'Saving...' : 'Move to Pending'}
-                    </button>
-                  </>
-                )}
-              </div>
-            </div>
-          </div>
-        ) : (
-          <div className="no-ticket">No ticket draft available</div>
-        )
-      )}
-
       {activeTab === "pending" && renderTickets(pendingTickets, "Pending Tickets", true)}
       {activeTab === "completed" && renderTickets(completedTickets, "Completed Tickets", false)}
     </div>

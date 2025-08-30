@@ -90,16 +90,6 @@ initWhatsapp()
   .then(() => console.log("📲 WhatsApp client initialized"))
   .catch((err) => console.error("❌ WhatsApp init error:", err));
 
-// ========================
-// 🔹 API Routes
-// ========================
-
-// Get QR code
-// app.get("/qr", (req, res) => {
-//   const qr = getQrCode();
-//   console.log("📌 QR requested:", qr ? "Available" : "Not available");
-//   res.json({ success: true, qr });
-// });
 // Get QR code
 app.get("/qr", (req, res) => {
   // Prevent caching
@@ -627,16 +617,4 @@ app.post("/generate-ticket", async (req, res) => {
 app.listen(process.env.PORT, () => {
   console.log(`🚀 Server running at http://localhost:${process.env.PORT}`);
 });
-//     res.json({ success: true, users });
-//   } catch (err) {
-//     res.status(500).json({ success: false, error: err.response?.data || err.message });
-//   }
 
-// });
-
-// ========================
-// 🔹 Start Express Server
-// ========================
-app.listen(process.env.PORT, () => {
-  console.log(`🚀 Server running at http://localhost:${process.env.PORT}`);
-});
