@@ -5,18 +5,12 @@ import mongoose from "mongoose";
 import fs from "fs";
 import multer from "multer";
 import path from "path";
-import { initWhatsapp, getQrCode } from "./Whatsapp Module/whatsapp.js";
-// import {
-//   createJiraIssue,
-//   getJiraIssue,
-//   updateJiraIssue,
-//   deleteJiraIssue,
-//   searchJiraIssues,
-//   addJiraComment,
-//   addJiraAttachment,
-//   getJiraProject,
-//   getJiraUsers
-// } from "./jira_Module/jira.js";
+import { initWhatsapp, getQrCode, sendMessage } from "./Whatsapp Module/whatsapp.js";
+import { generateTicketDraft } from "./AI integration/jiradraft.js";
+import {
+  createJiraIssue,
+  addJiraAttachment
+} from "./jira_Module/jira.js";
 
 
 // // Setup multer for attachments
@@ -74,6 +68,22 @@ const ticketSchema = new mongoose.Schema({
 const Ticket = mongoose.model("Ticket", ticketSchema);
 
 // ========================
+// 🔹 Jira Template Schema & Model
+// ========================
+const jiraTemplateSchema = new mongoose.Schema({
+  ticketId: { type: mongoose.Schema.Types.ObjectId, ref: 'Ticket', required: true },
+  summary: { type: String, required: true },
+  description: { type: String, required: true },
+  issueType: { type: String, required: true },
+  priority: { type: String },
+  jiraKey: { type: String },
+  status: { type: Number, default: 0 }, // 0: template only, 1: pushed to Jira
+  createdAt: { type: Date, default: Date.now },
+});
+
+const JiraTemplate = mongoose.model("JiraTemplate", jiraTemplateSchema);
+
+// ========================
 // 🔹 Start WhatsApp Session
 // ========================
 initWhatsapp()
@@ -111,7 +121,6 @@ app.get("/qr", (req, res) => {
 
   res.json({ success: true, qr });
 });
-
 
 // Create Ticket (POST)
 app.post("/tickets", async (req, res) => {
@@ -175,11 +184,30 @@ app.post("/tickets", async (req, res) => {
       } : null
     };
 
-    console.log('📎 Media details:', {
-      hasMedia: !!newTicket.media,
-      filepath: newTicket.media?.filepath || 'None',
-      url: newTicket.media ? `/media/${newTicket._id}` : 'None'
-    });
+    // Forward to generate-ticket endpoint for Jira ticket creation
+    try {
+      const generateTicketResponse = await fetch('http://localhost:4000/generate-ticket', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          message: text,
+          from: from,
+          type: type,
+          media: ticketData.media,
+          ticketId: newTicket._id
+        })
+      });
+
+      if (!generateTicketResponse.ok) {
+        console.error('⚠️ Warning: Failed to generate Jira ticket:', await generateTicketResponse.text());
+      } else {
+        console.log('✅ Jira ticket generation initiated');
+      }
+    } catch (genError) {
+      console.error('⚠️ Error forwarding to ticket generation:', genError);
+    }
 
     res.json({ 
       success: true, 
@@ -232,6 +260,264 @@ app.get("/tickets/:id/media-path", async (req, res) => {
     res.status(500).json({ success: false, error: err.message });
   }
 });
+
+
+ // -------------------- LLM Endpoints --------------------
+
+// POST /generate-ticket → Generate Jira ticket template and create issue
+// Store the latest ticket draft
+let latestTicketDraft = null;
+const ticketUpdateClients = new Set();
+
+// SSE endpoint for real-time ticket updates
+app.get('/ticket-updates', (req, res) => {
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  
+  ticketUpdateClients.add(res);
+  
+  req.on('close', () => {
+    ticketUpdateClients.delete(res);
+  });
+});
+
+// Get latest ticket draft
+app.get('/latest-ticket-draft', (req, res) => {
+  if (latestTicketDraft) {
+    res.json({ success: true, ticket: latestTicketDraft });
+  } else {
+    res.status(404).json({ success: false, error: 'No ticket draft available' });
+  }
+});
+
+// Get Jira template for a specific ticket
+app.get('/ticket/:ticketId/jira-template', async (req, res) => {
+  try {
+    const template = await JiraTemplate.findOne({ ticketId: req.params.ticketId })
+      .sort({ createdAt: -1 }); // Get the most recent template if multiple exist
+    
+    if (!template) {
+      return res.status(404).json({ 
+        success: false, 
+        error: 'No Jira template found for this ticket' 
+      });
+    }
+    
+    res.json({ success: true, template });
+  } catch (err) {
+    console.error('❌ Error fetching Jira template:', err);
+    res.status(500).json({ 
+      success: false, 
+      error: err.message 
+    });
+  }
+});
+
+// Save template as pending
+app.post('/save-as-pending', async (req, res) => {
+  try {
+    const { summary, description, issueType, priority, ticketId } = req.body;
+    
+    if (!ticketId || !summary || !description || !issueType) {
+      return res.status(400).json({
+        success: false,
+        error: 'Required fields missing'
+      });
+    }
+
+    // Create new template
+    const jiraTemplate = new JiraTemplate({
+      ticketId,
+      summary,
+      description,
+      issueType,
+      priority,
+      status: 0 // Set as pending
+    });
+    
+    await jiraTemplate.save();
+    console.log('✅ Template saved as pending:', jiraTemplate._id);
+
+    res.json({
+      success: true,
+      template: jiraTemplate
+    });
+  } catch (err) {
+    console.error('❌ Error saving template as pending:', err);
+    res.status(500).json({
+      success: false,
+      error: err.message
+    });
+  }
+});
+
+// Get all templates with status
+app.get('/jira-templates', async (req, res) => {
+  try {
+    const templates = await JiraTemplate.find()
+      .sort({ createdAt: -1 })
+      .populate('ticketId', 'from message media'); // Include ticket details we need
+    
+    // Group templates by status
+    const pendingTemplates = templates.filter(t => t.status === 0);
+    const completedTemplates = templates.filter(t => t.status === 1);
+    
+    res.json({
+      success: true,
+      templates: {
+        pending: pendingTemplates,
+        completed: completedTemplates
+      }
+    });
+  } catch (err) {
+    console.error('❌ Error fetching templates:', err);
+    res.status(500).json({
+      success: false,
+      error: err.message
+    });
+  }
+});
+
+// Push template to Jira
+app.post('/ticket/:templateId/push-to-jira', async (req, res) => {
+  try {
+    // Find the template
+    const template = await JiraTemplate.findById(req.params.templateId);
+    if (!template) {
+      return res.status(404).json({
+        success: false,
+        error: 'Template not found'
+      });
+    }
+
+    // Check if already pushed to Jira
+    if (template.status === 1) {
+      return res.status(400).json({
+        success: false,
+        error: 'Template already pushed to Jira',
+        jiraKey: template.jiraKey
+      });
+    }
+
+    // Find the associated ticket for media info
+    const ticket = await Ticket.findById(template.ticketId);
+
+    // Create Jira issue
+    const jiraIssue = await createJiraIssue({
+      summary: template.summary,
+      description: template.description,
+      issueType: template.issueType,
+      priority: template.priority
+    });
+
+    // If there's media, attach it to the Jira issue
+    if (ticket?.media?.filepath) {
+      try {
+        await addJiraAttachment(jiraIssue.key, ticket.media.filepath);
+        console.log('✅ Media attached to Jira issue');
+      } catch (attachError) {
+        console.error('⚠️ Failed to attach media:', attachError);
+      }
+    }
+
+    // Update template with Jira key and status
+    template.jiraKey = jiraIssue.key;
+    template.status = 1;
+    await template.save();
+
+    // Send confirmation message back to WhatsApp
+    if (ticket) {
+      try {
+        await sendMessage(ticket.from, 
+          `✅ Ticket created in Jira!\nKey: ${jiraIssue.key}\nSummary: ${template.summary}`
+        );
+      } catch (whatsappError) {
+        console.error('⚠️ Failed to send WhatsApp confirmation:', whatsappError);
+      }
+    }
+
+    res.json({
+      success: true,
+      template,
+      jiraIssue
+    });
+
+  } catch (err) {
+    console.error('❌ Error pushing to Jira:', err);
+    res.status(500).json({
+      success: false,
+      error: err.message
+    });
+  }
+});
+
+app.post("/generate-ticket", async (req, res) => {
+  try {
+    const { message, from, type, media, ticketId } = req.body;
+    console.log('📝 Generating ticket for message:', { from, type, hasMedia: !!media, ticketId });
+
+    if (!message) {
+      return res.status(400).json({ success: false, error: 'Message is required' });
+    }
+
+    // Notify clients that generation has started
+    ticketUpdateClients.forEach(client => {
+      client.write(`event: generating\ndata: true\n\n`);
+    });
+
+    // Generate Jira ticket draft using AI
+    const ticketDraft = await generateTicketDraft({
+      message,
+      from,
+      type,
+      hasAttachment: !!media,
+      ticketId
+    });
+    
+    // Store the ticket draft in MongoDB
+    const jiraTemplate = new JiraTemplate({
+      ticketId,
+      summary: ticketDraft.summary,
+      description: ticketDraft.description,
+      issueType: ticketDraft.issueType,
+      priority: ticketDraft.priority
+    });
+    await jiraTemplate.save();
+    console.log('✅ Jira template saved to MongoDB:', jiraTemplate._id);
+    
+    // Store the latest ticket draft in memory for real-time updates with template ID
+    latestTicketDraft = {
+      ...ticketDraft,
+      _id: jiraTemplate._id,
+      ticketId: ticketId
+    };
+    
+    // Notify all connected clients about the new ticket draft
+    ticketUpdateClients.forEach(client => {
+      client.write(`data: ${JSON.stringify({ ticket: latestTicketDraft })}\n\n`);
+    });
+    
+    console.log('✅ AI generated ticket draft:', ticketDraft);
+
+    // Return the generated template without creating Jira issue
+    res.json({
+      success: true,
+      ticket: ticketDraft,
+      template: jiraTemplate
+    });
+
+  } catch (err) {
+    console.error("❌ Error generating ticket:", err);
+    res.status(500).json({ 
+      success: false, 
+      error: err.message 
+    });
+  }
+});
+
+
+
 
 // // -------------------- Jira Endpoints --------------------
 
