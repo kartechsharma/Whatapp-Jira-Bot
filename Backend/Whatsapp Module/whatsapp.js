@@ -1,4 +1,3 @@
-
 import { create } from 'venom-bot';
 import fetch from 'node-fetch'; 
 
@@ -164,92 +163,122 @@ export async function initWhatsapp() {
 
 async function handleMessage(message) {
   try {
-    // Create ticket object matching server requirements
     const ticketData = {
       from: message.from,
-      text: '', // Changed from 'content' to 'text'
-      timestamp: new Date().toISOString(),
+      text: '',
       type: message.type,
       media: null
     };
 
+    // Enhanced media check and download
+    if (message.isMedia || message.type === 'image' || message.type === 'video' || message.type === 'document') {
+      try {
+        console.log('📥 Starting media download...', {
+          messageId: message.id,
+          type: message.type,
+          hasMedia: message.isMedia
+        });
+
+        // Use the correct method to download media
+        const buffer = await client.decryptFile(message);
+        
+        if (buffer) {
+          console.log('💾 Media downloaded, processing...');
+          
+          // Convert buffer to base64
+          const base64Data = buffer.toString('base64');
+          
+          // Determine MIME type based on message type
+          const mimetype = message.mimetype || 
+            (message.type === 'image' ? 'image/jpeg' : 
+             message.type === 'video' ? 'video/mp4' : 
+             'application/octet-stream');
+
+          ticketData.media = {
+            mimetype,
+            data: base64Data,
+            filename: message.filename || `${message.type}_${Date.now()}`
+          };
+
+          console.log('✅ Media processed:', {
+            type: mimetype,
+            dataSize: base64Data.length,
+            filename: ticketData.media.filename
+          });
+        } else {
+          throw new Error('Media decryption returned empty buffer');
+        }
+      } catch (err) {
+        console.error('❌ Media download failed:', err);
+        ticketData.text += ' (Media download failed)';
+      }
+    }
+
+    // Set message text with proper caption handling
     switch (message.type) {
-      case 'chat':
-        console.log('💬 Text message:', message.body);
-        ticketData.text = message.body; // Use 'text' instead of 'content'
-        break;
-
       case 'image':
-        console.log('🖼️ Image received');
-        ticketData.text = message.caption || 'No caption';
-        try {
-          const media = await message.downloadMedia();
-          ticketData.media = {
-            mimetype: media.mimetype,
-            data: media.data
-          };
-        } catch (err) {
-          console.error('❌ Error downloading image:', err);
-        }
+        ticketData.text = message.caption || 'Image received';
         break;
-
+      case 'video':
+        ticketData.text = message.caption || 'Video received';
+        break;
       case 'document':
-        console.log('📄 Document received');
-        ticketData.text = message.filename || 'Unknown document';
-        try {
-          const media = await message.downloadMedia();
-          ticketData.media = {
-            mimetype: media.mimetype,
-            data: media.data,
-            filename: message.filename
-          };
-        } catch (err) {
-          console.error('❌ Error downloading document:', err);
-        }
+        ticketData.text = message.filename || 'Document received';
         break;
-
       default:
-        console.log('📎 Other message type:', message.type);
-        ticketData.text = 'Unsupported message type: ' + message.type;
+        ticketData.text = message.body || '';
     }
 
-    // Validate required fields
-    if (!ticketData.from || !ticketData.text) {
-      throw new Error('Missing required fields: from and text must be present');
+    // Verify media data before sending
+    if (ticketData.media) {
+      console.log('🔍 Verifying media data:', {
+        hasData: !!ticketData.media.data,
+        dataLength: ticketData.media.data?.length || 0,
+        mimetype: ticketData.media.mimetype
+      });
     }
 
-    // Log processed message
-    console.log('✅ Processing message:', {
-      from: ticketData.from,
-      type: ticketData.type,
-      timestamp: ticketData.timestamp
+    // Send to server
+    const response = await fetch('http://localhost:4000/tickets', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json'
+      },
+      body: JSON.stringify(ticketData)
     });
 
-    // Send ticket to server
-    try {
-      const response = await fetch('http://localhost:4000/tickets', {
-        method: 'POST',
-        headers: { 
-          'Content-Type': 'application/json',
-          'Accept': 'application/json'
-        },
-        body: JSON.stringify(ticketData)
-      });
-
-      if (!response.ok) {
-        const errorText = await response.text();
-        throw new Error(`HTTP error! status: ${response.status}, message: ${errorText}`);
-      }
-
-      const responseData = await response.json();
-      console.log('✅ Ticket created successfully:', responseData);
-
-    } catch (error) {
-      console.error('❌ Error creating ticket:', error);
+    if (!response.ok) {
+      const errorData = await response.text();
+      throw new Error(`HTTP error! status: ${response.status}, message: ${errorData}`);
     }
 
+    const result = await response.json();
+    console.log('✅ Ticket created:', {
+      success: result.success,
+      ticketId: result.ticket?._id,
+      hasMedia: !!result.ticket?.media,
+      mediaPath: result.ticket?.media?.filepath || 'No media',
+      mediaUrl: result.ticket?.media?.url || 'No URL'
+    });
+
+    // Send enhanced acknowledgment
+    const mediaInfo = result.ticket?.media?.filepath 
+      ? `\nMedia saved at: ${result.ticket.media.filepath}`
+      : '';
+      
+    await client.sendText(
+      message.from, 
+      `✅ Message received and processed${mediaInfo}`
+    );
+
   } catch (error) {
-    console.error('❌ Error handling message:', error);
+    console.error('❌ Error in handleMessage:', error);
+    try {
+      await client.sendText(message.from, '❌ Sorry, there was an error processing your message.');
+    } catch (sendError) {
+      console.error('❌ Error sending error message:', sendError);
+    }
   }
 }
 
